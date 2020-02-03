@@ -24,6 +24,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/device.h>
+#include <linux/mm.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/kernel.h>
@@ -100,8 +101,38 @@ long char_ctrl_ioctl(struct file *file_p, unsigned int cmd, unsigned long arg) {
 	return status;
 }
 
+static int xvc_mmap(struct file *filep, struct vm_area_struct *vma)
+{
+	unsigned long requested_pages, actual_pages;
+	unsigned long db_addr = 0;
+	unsigned long db_size = 0;
+	int minor = iminor(filep->f_path.dentry->d_inode);
+
+	if (vma->vm_end < vma->vm_start)
+		return -EINVAL;
+
+	if (db_res[minor]) {
+		db_addr = db_res[minor]->start;
+		db_size = resource_size(db_res[minor]);
+	}
+
+	requested_pages = vma_pages(vma);
+	actual_pages = ((db_addr & ~PAGE_MASK)
+			+ db_size + PAGE_SIZE -1) >> PAGE_SHIFT;
+	if (requested_pages > actual_pages) {
+		return -EINVAL;
+	}
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	return remap_pfn_range(vma,
+			       vma->vm_start,
+			       db_addr >> PAGE_SHIFT,
+			       vma->vm_end - vma->vm_start,
+			       vma->vm_page_prot);
+}
+
 static struct file_operations xil_xvc_ioc_ops = {
 	.owner = THIS_MODULE,
+	.mmap = xvc_mmap,
 	.unlocked_ioctl = char_ctrl_ioctl
 };
 
@@ -243,7 +274,6 @@ static int remove(struct platform_device* pdev) {
 			}
 		}
 	}
-
 	return 0;
 }
 
