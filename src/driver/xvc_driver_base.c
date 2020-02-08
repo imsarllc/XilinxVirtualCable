@@ -24,6 +24,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/device.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/kernel.h>
 #include <asm/io.h>
@@ -42,12 +43,13 @@ static struct class* xvc_dev_class = NULL;
 static struct cdev xvc_char_ioc_dev;
 
 #ifndef _XVC_USER_CONFIG_H
+#define MAX_CONFIG_COUNT 8
 #define CONFIG_COUNT 1
 #define GET_DB_BY_RES 1
-static struct resource *db_res = NULL;
+static struct resource *db_res[MAX_CONFIG_COUNT];
 #endif /* _XVC_USER_CONFIG_H */
 
-static void __iomem * db_ptrs[CONFIG_COUNT];
+static void __iomem * db_ptrs[MAX_CONFIG_COUNT];
 
 static void xil_xvc_cleanup(void) {
 	printk(KERN_INFO LOG_PREFIX "Cleaning up resources...\n");
@@ -58,20 +60,20 @@ static void xil_xvc_cleanup(void) {
 		if (xvc_char_ioc_dev.owner != NULL) {
 			cdev_del(&xvc_char_ioc_dev);
 		}
-		unregister_chrdev_region(xvc_ioc_dev_region, CONFIG_COUNT);
+		unregister_chrdev_region(xvc_ioc_dev_region, MAX_CONFIG_COUNT);
 	}
 }
 
 long char_ctrl_ioctl(struct file *file_p, unsigned int cmd, unsigned long arg) {
 	long status = 0;
 	unsigned long irqflags = 0;
-	int char_index = iminor(file_p->f_path.dentry->d_inode) - MINOR(xvc_ioc_dev_region);
+	int minor = iminor(file_p->f_path.dentry->d_inode);
 
 	spin_lock_irqsave(&file_p->f_path.dentry->d_inode->i_lock, irqflags);
 
 	switch (cmd) {
 		case XDMA_IOCXVC:
-			status = xil_xvc_ioctl((unsigned char*)(db_ptrs[char_index]), (void __user *)arg);
+			status = xil_xvc_ioctl((unsigned char*)(db_ptrs[minor]), (void __user *)arg);
 			break;
 		case XDMA_RDXVC_PROPS:
 			{
@@ -80,8 +82,8 @@ long char_ctrl_ioctl(struct file *file_p, unsigned int cmd, unsigned long arg) {
 #else
 				struct db_config config_info = {
 					.name = NULL,
-					.base_addr = db_res ? db_res->start : 0,
-					.size = db_res ? resource_size(db_res) : 0,
+					.base_addr = db_res[minor] ? db_res[minor]->start : 0,
+					.size = db_res[minor] ? resource_size(db_res[minor]) : 0,
 				};
 #endif
 				status = xil_xvc_readprops(&config_info, (void __user*)arg);
@@ -103,10 +105,11 @@ static struct file_operations xil_xvc_ioc_ops = {
 	.unlocked_ioctl = char_ctrl_ioctl
 };
 
+static DEFINE_MUTEX(device_list_lock);
+static DECLARE_BITMAP(minors, MAX_CONFIG_COUNT);
+
 int probe(struct platform_device* pdev) {
 	int status;
-	int i;
-	unsigned int use_index = CONFIG_COUNT > 1;
 	dev_t ioc_device_number;
 	char ioc_device_name[32];
 	struct device* xvc_ioc_device = NULL;
@@ -121,7 +124,7 @@ int probe(struct platform_device* pdev) {
 
 		cdev_init(&xvc_char_ioc_dev, &xil_xvc_ioc_ops);
 		xvc_char_ioc_dev.owner = THIS_MODULE;
-		status = cdev_add(&xvc_char_ioc_dev, xvc_ioc_dev_region, CONFIG_COUNT);
+		status = cdev_add(&xvc_char_ioc_dev, xvc_ioc_dev_region, MAX_CONFIG_COUNT);
 		if (status != 0) {
 			xil_xvc_cleanup();
 			dev_err(&pdev->dev, "unable to add char device\n");
@@ -129,17 +132,15 @@ int probe(struct platform_device* pdev) {
 		}
 	}
 
-	for (i = 0; i < CONFIG_COUNT; ++i) {
-		if (db_ptrs[i] == NULL) {
+	{
+		{
+			unsigned long		minor;
+
 #ifndef GET_DB_BY_RES
+			unsigned int use_index = CONFIG_COUNT > 1;
 			const char *name = db_configs[i].name;
 			unsigned long db_addr = db_configs[i].base_addr;
 			unsigned long db_size = db_configs[i].size;
-#else
-			const char *name = NULL;
-			unsigned long db_addr = 0;
-			unsigned long db_size = 0;
-#endif
 
 			if (name && name[0]) {
 				sprintf(ioc_device_name, "%s_%s", XVC_DRIVER_NAME, name);
@@ -148,30 +149,55 @@ int probe(struct platform_device* pdev) {
 			} else {
 				sprintf(ioc_device_name, "%s", XVC_DRIVER_NAME);
 			}
+#else
+			const char *name;
+			unsigned long db_addr = 0;
+			unsigned long db_size = 0;
+			int ret;
 
-			ioc_device_number = MKDEV(MAJOR(xvc_ioc_dev_region), MINOR(xvc_ioc_dev_region) + i);
-
-			xvc_ioc_device = device_create(xvc_dev_class, NULL, ioc_device_number, NULL, ioc_device_name);
-			if (IS_ERR(xvc_ioc_device)) {
-				printk(KERN_WARNING LOG_PREFIX "Failed to create device %s", ioc_device_name);
-				xil_xvc_cleanup();
-				dev_err(&pdev->dev, "unable to create the device\n");
-				return status;
-			} else {
-				printk(KERN_INFO LOG_PREFIX "Created device %s", ioc_device_name);
+			ret = of_property_read_string(pdev->dev.of_node, "imsar,name", &name);
+			if(ret < 0) {
+				dev_info(&pdev->dev, "no property imsar,name, using device name: %s\n", pdev->dev.of_node->name);
+				name = pdev->dev.of_node->name;
 			}
+			sprintf(ioc_device_name, "xvc_%s", name);
+#endif
+
+			mutex_lock(&device_list_lock);
+			minor = find_first_zero_bit(minors, MAX_CONFIG_COUNT);
+			if (minor < MAX_CONFIG_COUNT) {
+				ioc_device_number = MKDEV(MAJOR(xvc_ioc_dev_region), minor);
+				xvc_ioc_device = device_create(xvc_dev_class, NULL, ioc_device_number, NULL, ioc_device_name);
+				if (PTR_ERR_OR_ZERO(xvc_ioc_device)) {
+					printk(KERN_WARNING LOG_PREFIX "Failed to create device %s", ioc_device_name);
+					xil_xvc_cleanup();
+					dev_err(&pdev->dev, "unable to create the device\n");
+					return status;
+				} else {
+					printk(KERN_INFO LOG_PREFIX "Created device %s", ioc_device_name);
+				}
+			} else {
+				dev_dbg(&pdev->dev, "no minor number available!\n");
+				status = -ENODEV;
+			}
+			if (status == 0) {
+				set_bit(minor, minors);
+				db_res[minor] = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+				db_ptrs[minor] = devm_ioremap_resource(&pdev->dev, db_res[minor]);
+			}
+			mutex_unlock(&device_list_lock);
+
 
 #ifndef GET_DB_BY_RES
 			db_ptrs[i] = ioremap_nocache(db_addr, db_size);
 #else
-			db_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-			if (db_res) {
-				db_addr = db_res->start;
-				db_size = resource_size(db_res);
+			if (db_res[minor]) {
+				db_addr = db_res[minor]->start;
+				db_size = resource_size(db_res[minor]);
 			}
-			db_ptrs[i] = devm_ioremap_resource(&pdev->dev, db_res);
+			printk(KERN_ERR LOG_PREFIX "debug bridge %s memory at offset 0x%lX, size %lu", ioc_device_name, db_addr, db_size);
 #endif
-			if (!db_ptrs[i] || IS_ERR(db_ptrs[i])) {
+			if (!db_ptrs[minor] || IS_ERR(db_ptrs[minor])) {
 				printk(KERN_ERR LOG_PREFIX "Failed to remap debug bridge memory at offset 0x%lX, size %lu", db_addr, db_size);
 				return -ENOMEM;
 			} else {
@@ -187,7 +213,7 @@ static int remove(struct platform_device* pdev) {
 	int i;
 	dev_t ioc_device_number;
 	if (pdev) {
-		for (i = 0; i < CONFIG_COUNT; ++i) {
+		for (i = 0; i < MAX_CONFIG_COUNT; ++i) {
 			if (db_ptrs[i]) {
 #ifndef GET_DB_BY_RES
 				unsigned long db_addr = db_configs[i].base_addr;
@@ -195,9 +221,9 @@ static int remove(struct platform_device* pdev) {
 #else
 				unsigned long db_addr = 0;
 				unsigned long db_size = 0;
-				if (db_res) {
-					db_addr = db_res->start;
-					db_size = resource_size(db_res);
+				if (db_res[i]) {
+					db_addr = db_res[i]->start;
+					db_size = resource_size(db_res[i]);
 				}
 #endif
 
@@ -207,10 +233,12 @@ static int remove(struct platform_device* pdev) {
 #else
 				// devm_ioremap_resource is managed by the kernel and undone on driver detach.
 #endif
+				mutex_lock(&device_list_lock);
 				db_ptrs[i] = NULL;
-
-				ioc_device_number = MKDEV(MAJOR(xvc_ioc_dev_region), MINOR(xvc_ioc_dev_region) + i);
+				ioc_device_number = MKDEV(MAJOR(xvc_ioc_dev_region), i);
 				device_destroy(xvc_dev_class, ioc_device_number);
+				clear_bit(i, minors);
+				mutex_unlock(&device_list_lock);
 				printk(KERN_INFO LOG_PREFIX "Destroyed device number %u (user config %i)", ioc_device_number, i);
 			}
 		}
@@ -246,7 +274,7 @@ static int __init xil_xvc_init(void) {
 	printk(KERN_INFO LOG_PREFIX "Starting...\n");
 
 	// Register the character packet device major and minor numbers
-	err = alloc_chrdev_region(&xvc_ioc_dev_region, 0, CONFIG_COUNT, XVC_DRIVER_NAME);
+	err = alloc_chrdev_region(&xvc_ioc_dev_region, 0, MAX_CONFIG_COUNT, XVC_DRIVER_NAME);
 	if (err != 0) {
 		xil_xvc_cleanup();
 		printk(KERN_ERR LOG_PREFIX "unable to get char device region\n");
